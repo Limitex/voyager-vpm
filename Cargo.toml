@@ -2,6 +2,7 @@
 name = "voyager"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/Limitex/voyager-vpm"
 
 [[bin]]
 name = "voy"
@@ -36,3 +37,8 @@ wiremock = "0.6"
 tempfile = "3.24.0"
 tokio-test = "0.4"
 pretty_assertions = "1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

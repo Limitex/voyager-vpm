@@ -20,16 +20,15 @@ static COLOR_ENABLED: OnceLock<bool> = OnceLock::new();
 pub fn init(quiet: bool, color: ColorChoice) {
     QUIET_MODE.set(quiet).ok();
 
-    let color_enabled = match color {
-        ColorChoice::Always => true,
-        ColorChoice::Never => false,
-        ColorChoice::Auto => {
-            // NO_COLOR standard: https://no-color.org/
-            if std::env::var("NO_COLOR").is_ok() {
-                false
-            } else {
-                console::colors_enabled()
-            }
+    let no_color = std::env::var("NO_COLOR").is_ok();
+    let color_enabled = if no_color {
+        // NO_COLOR standard: https://no-color.org/
+        false
+    } else {
+        match color {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => console::colors_enabled(),
         }
     };
     COLOR_ENABLED.set(color_enabled).ok();

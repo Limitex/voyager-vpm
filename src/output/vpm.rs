@@ -1,6 +1,8 @@
 use crate::config::Manifest;
+use crate::lock::Sample;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VpmOutput {
@@ -59,6 +61,7 @@ pub struct VersionOutput {
     pub version: String,
     pub display_name: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub unity: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub unity_release: String,
@@ -69,9 +72,35 @@ pub struct VersionOutput {
     pub author: Author,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub vpm_dependencies: IndexMap<String, String>,
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub legacy_folders: IndexMap<String, String>,
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub legacy_files: IndexMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_packages: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub documentation_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub changelog_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub licenses_url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<Sample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hide_in_editor: Option<bool>,
+    #[serde(default, skip_serializing_if = "String::is_empty", rename = "type")]
+    pub package_type: String,
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        rename = "zipSHA256"
+    )]
+    pub zip_sha256: String,
     pub url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub license: String,
+    #[serde(default, flatten, skip_serializing_if = "IndexMap::is_empty")]
+    pub extra: IndexMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,8 +161,19 @@ repository = "owner/repo2"
                 url: String::new(),
             },
             vpm_dependencies: IndexMap::new(),
+            legacy_folders: IndexMap::new(),
+            legacy_files: IndexMap::new(),
+            legacy_packages: vec![],
+            documentation_url: String::new(),
+            changelog_url: String::new(),
+            licenses_url: String::new(),
+            samples: vec![],
+            hide_in_editor: None,
+            package_type: String::new(),
+            zip_sha256: String::new(),
             url: url.to_string(),
             license: String::new(),
+            extra: IndexMap::new(),
         }
     }
 
@@ -308,6 +348,21 @@ repository = "owner/repo"
             assert!(!json.contains("\"dependencies\""));
             assert!(!json.contains("\"keywords\""));
             assert!(!json.contains("\"license\""));
+            assert!(!json.contains("\"legacyFolders\""));
+            assert!(!json.contains("\"legacyFiles\""));
+            assert!(!json.contains("\"legacyPackages\""));
+            assert!(!json.contains("\"changelogUrl\""));
+            assert!(!json.contains("\"zipSHA256\""));
+        }
+
+        #[test]
+        fn unity_is_skipped_when_empty() {
+            let mut version =
+                create_version_output("test", "1.0.0", "https://example.com/test.zip");
+            version.unity = String::new();
+            let json = serde_json::to_string(&version).unwrap();
+
+            assert!(!json.contains("\"unity\""));
         }
 
         #[test]
@@ -325,6 +380,49 @@ repository = "owner/repo"
             assert_eq!(parsed.url, version.url);
             assert_eq!(parsed.keywords, version.keywords);
             assert_eq!(parsed.license, version.license);
+        }
+
+        #[test]
+        fn roundtrip_preserves_unknown_fields() {
+            let mut version =
+                create_version_output("test", "1.0.0", "https://example.com/test.zip");
+            version.extra.insert(
+                "customField".to_string(),
+                serde_json::Value::String("custom_value".to_string()),
+            );
+
+            let json = serde_json::to_string(&version).unwrap();
+            let parsed: VersionOutput = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(
+                parsed.extra.get("customField"),
+                Some(&serde_json::Value::String("custom_value".to_string()))
+            );
+        }
+
+        #[test]
+        fn roundtrip_preserves_known_optional_fields() {
+            let mut version =
+                create_version_output("test", "1.0.0", "https://example.com/test.zip");
+            version.documentation_url = "https://example.com/docs".to_string();
+            version.licenses_url = "https://example.com/license".to_string();
+            version.hide_in_editor = Some(true);
+            version.package_type = "library".to_string();
+            version.samples = vec![Sample {
+                display_name: "Demo".to_string(),
+                description: "A demo".to_string(),
+                path: "Samples~/Demo".to_string(),
+            }];
+
+            let json = serde_json::to_string(&version).unwrap();
+            let parsed: VersionOutput = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(parsed.documentation_url, "https://example.com/docs");
+            assert_eq!(parsed.licenses_url, "https://example.com/license");
+            assert_eq!(parsed.hide_in_editor, Some(true));
+            assert_eq!(parsed.package_type, "library");
+            assert_eq!(parsed.samples.len(), 1);
+            assert_eq!(parsed.samples[0].display_name, "Demo");
         }
     }
 }

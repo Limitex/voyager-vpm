@@ -61,8 +61,19 @@ fn to_output_version(manifest: &PackageManifest) -> VersionOutput {
             url: manifest.author.url.clone(),
         },
         vpm_dependencies: manifest.vpm_dependencies.clone(),
+        legacy_folders: manifest.legacy_folders.clone(),
+        legacy_files: manifest.legacy_files.clone(),
+        legacy_packages: manifest.legacy_packages.clone(),
+        documentation_url: manifest.documentation_url.clone(),
+        changelog_url: manifest.changelog_url.clone(),
+        licenses_url: manifest.licenses_url.clone(),
+        samples: manifest.samples.clone(),
+        hide_in_editor: manifest.hide_in_editor,
+        package_type: manifest.package_type.clone(),
+        zip_sha256: manifest.zip_sha256.clone(),
         url: manifest.url.clone(),
         license: manifest.license.clone(),
+        extra: manifest.extra.clone(),
     }
 }
 
@@ -114,8 +125,19 @@ mod tests {
                 url: String::new(),
             },
             vpm_dependencies: IndexMap::new(),
+            legacy_folders: IndexMap::new(),
+            legacy_files: IndexMap::new(),
+            legacy_packages: vec![],
+            documentation_url: String::new(),
+            changelog_url: String::new(),
+            licenses_url: String::new(),
+            samples: vec![],
+            hide_in_editor: None,
+            package_type: String::new(),
+            zip_sha256: String::new(),
             url: "https://example.com/test.zip".to_string(),
             license: String::new(),
+            extra: IndexMap::new(),
         }
     }
 
@@ -220,5 +242,76 @@ mod tests {
         assert_eq!(pkg_output.versions.len(), 2);
         assert!(pkg_output.versions.contains_key("1.0.0"));
         assert!(pkg_output.versions.contains_key("2.0.0"));
+    }
+
+    #[test]
+    fn generate_preserves_vpm_extension_fields() {
+        let manifest = Manifest {
+            vpm: Vpm {
+                id: "com.example.vpm".to_string(),
+                name: "Example VPM".to_string(),
+                author: "Example Author".to_string(),
+                url: "https://example.com/vpm.json".to_string(),
+            },
+            packages: vec![Package {
+                id: "com.example.pkg".to_string(),
+                repository: repo("owner/repo"),
+            }],
+        };
+
+        let mut lockfile = Lockfile::new();
+        let mut pkg_manifest = create_version_output("com.example.pkg", "1.0.0");
+        pkg_manifest
+            .legacy_folders
+            .insert("Assets/Old".to_string(), "Assets/New".to_string());
+        pkg_manifest.legacy_files.insert(
+            "Assets/Old.prefab".to_string(),
+            "Assets/New.prefab".to_string(),
+        );
+        pkg_manifest
+            .legacy_packages
+            .push("com.example.legacy".to_string());
+        pkg_manifest.changelog_url = "https://example.com/changelog".to_string();
+        pkg_manifest.zip_sha256 = "deadbeef".to_string();
+        pkg_manifest.extra.insert(
+            "documentationUrl".to_string(),
+            serde_json::Value::String("https://example.com/docs".to_string()),
+        );
+
+        let pkg = LockedPackage {
+            id: "com.example.pkg".to_string(),
+            repository: repo("owner/repo"),
+            versions: vec![LockedVersion::new(
+                "v1.0.0".to_string(),
+                "https://example.com/v1.zip".to_string(),
+                r#"{"name":"pkg"}"#,
+                pkg_manifest,
+            )],
+        };
+        lockfile.packages.push(pkg);
+
+        let output = generate_from_lockfile(&manifest, &lockfile).unwrap();
+        let version = output.packages["com.example.pkg"].versions["1.0.0"].clone();
+
+        assert_eq!(
+            version.legacy_folders.get("Assets/Old").map(String::as_str),
+            Some("Assets/New")
+        );
+        assert_eq!(
+            version
+                .legacy_files
+                .get("Assets/Old.prefab")
+                .map(String::as_str),
+            Some("Assets/New.prefab")
+        );
+        assert_eq!(version.legacy_packages, vec!["com.example.legacy"]);
+        assert_eq!(version.changelog_url, "https://example.com/changelog");
+        assert_eq!(version.zip_sha256, "deadbeef");
+        assert_eq!(
+            version.extra.get("documentationUrl"),
+            Some(&serde_json::Value::String(
+                "https://example.com/docs".to_string()
+            ))
+        );
     }
 }

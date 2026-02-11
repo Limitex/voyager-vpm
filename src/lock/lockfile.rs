@@ -234,8 +234,19 @@ mod tests {
                 url: String::new(),
             },
             vpm_dependencies: IndexMap::new(),
+            legacy_folders: IndexMap::new(),
+            legacy_files: IndexMap::new(),
+            legacy_packages: vec![],
+            documentation_url: String::new(),
+            changelog_url: String::new(),
+            licenses_url: String::new(),
+            samples: vec![],
+            hide_in_editor: None,
+            package_type: String::new(),
+            zip_sha256: String::new(),
             url: "https://example.com/test.zip".to_string(),
             license: String::new(),
+            extra: IndexMap::new(),
         }
     }
 

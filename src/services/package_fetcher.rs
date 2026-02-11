@@ -1,9 +1,10 @@
-use crate::config::{Manifest, Package};
+use crate::config::{Manifest, Package, validation};
 use crate::domain::Release;
 use crate::error::{Error, Result};
 use crate::infra::GitHubApi;
 use crate::lock::{LockedPackage, LockedVersion, Lockfile, PackageManifest};
 use futures::stream::{self, StreamExt};
+use semver::Version;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
@@ -34,6 +35,10 @@ struct PackageFetchResult {
 }
 
 impl<G: GitHubApi> PackageFetcher<G> {
+    fn is_valid_sha256_hex(value: &str) -> bool {
+        value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
     pub fn new(github: Arc<G>, config: FetcherConfig) -> Self {
         Self { github, config }
     }
@@ -72,6 +77,143 @@ impl<G: GitHubApi> PackageFetcher<G> {
                 release.tag(),
                 expected_version,
                 package.id
+            )));
+        }
+
+        if Version::parse(&manifest.version).is_err() {
+            return Err(Error::ConfigValidation(format!(
+                "package.json version '{}' is not valid SemVer for package '{}' (release '{}')",
+                manifest.version,
+                package.id,
+                release.tag()
+            )));
+        }
+
+        if manifest.display_name.trim().is_empty() {
+            return Err(Error::ConfigValidation(format!(
+                "package.json is missing required field 'displayName' for package '{}' (release '{}')",
+                package.id,
+                release.tag()
+            )));
+        }
+
+        if manifest.author.name.trim().is_empty() {
+            return Err(Error::ConfigValidation(format!(
+                "package.json is missing required field 'author.name' for package '{}' (release '{}')",
+                package.id,
+                release.tag()
+            )));
+        }
+
+        if manifest.author.email.trim().is_empty() {
+            return Err(Error::ConfigValidation(format!(
+                "package.json is missing required field 'author.email' for package '{}' (release '{}')",
+                package.id,
+                release.tag()
+            )));
+        }
+
+        if manifest.unity.trim().is_empty() {
+            if !manifest.unity_release.trim().is_empty() {
+                return Err(Error::ConfigValidation(format!(
+                    "package.json field 'unityRelease' requires field 'unity' for package '{}' (release '{}')",
+                    package.id,
+                    release.tag()
+                )));
+            }
+            warn!(
+                package_id = %package.id,
+                release = %release.tag(),
+                "package.json is missing recommended field 'unity'"
+            );
+        } else if let Err(e) = validation::validate_unity_version(&manifest.unity) {
+            return Err(Error::ConfigValidation(format!(
+                "package.json field 'unity' is invalid for package '{}' (release '{}'): {}",
+                package.id,
+                release.tag(),
+                e
+            )));
+        }
+
+        if !manifest.unity_release.trim().is_empty()
+            && let Err(e) = validation::validate_unity_release(&manifest.unity_release)
+        {
+            return Err(Error::ConfigValidation(format!(
+                "package.json field 'unityRelease' is invalid for package '{}' (release '{}'): {}",
+                package.id,
+                release.tag(),
+                e
+            )));
+        }
+
+        if manifest.url.trim().is_empty() {
+            return Err(Error::ConfigValidation(format!(
+                "package.json is missing required field 'url' for package '{}' (release '{}')",
+                package.id,
+                release.tag()
+            )));
+        }
+
+        if let Err(e) = validation::validate_zip_url(&manifest.url) {
+            return Err(Error::ConfigValidation(format!(
+                "package.json field 'url' is invalid for package '{}' (release '{}'): {}",
+                package.id,
+                release.tag(),
+                e
+            )));
+        }
+
+        for (dependency_name, dependency_version) in &manifest.dependencies {
+            if let Err(e) = validation::validate_reverse_domain(dependency_name) {
+                return Err(Error::ConfigValidation(format!(
+                    "package.json field 'dependencies' has invalid package name '{}' for package '{}' (release '{}'): {}",
+                    dependency_name,
+                    package.id,
+                    release.tag(),
+                    e
+                )));
+            }
+
+            if let Err(e) = validation::validate_unity_dependency_version(dependency_version) {
+                return Err(Error::ConfigValidation(format!(
+                    "package.json field 'dependencies' has invalid version '{}' for dependency '{}' in package '{}' (release '{}'): {}",
+                    dependency_version,
+                    dependency_name,
+                    package.id,
+                    release.tag(),
+                    e
+                )));
+            }
+        }
+
+        for (dependency_name, dependency_range) in &manifest.vpm_dependencies {
+            if let Err(e) = validation::validate_reverse_domain(dependency_name) {
+                return Err(Error::ConfigValidation(format!(
+                    "package.json field 'vpmDependencies' has invalid package name '{}' for package '{}' (release '{}'): {}",
+                    dependency_name,
+                    package.id,
+                    release.tag(),
+                    e
+                )));
+            }
+
+            if let Err(e) = validation::validate_vpm_dependency_range(dependency_range) {
+                return Err(Error::ConfigValidation(format!(
+                    "package.json field 'vpmDependencies' has invalid range '{}' for dependency '{}' in package '{}' (release '{}'): {}",
+                    dependency_range,
+                    dependency_name,
+                    package.id,
+                    release.tag(),
+                    e
+                )));
+            }
+        }
+
+        if !manifest.zip_sha256.is_empty() && !Self::is_valid_sha256_hex(&manifest.zip_sha256) {
+            return Err(Error::ConfigValidation(format!(
+                "package.json field 'zipSHA256' must be a 64-character hex string for package '{}' (release '{}')",
+                package.id,
+                release.tag()
             )));
         }
 
@@ -495,7 +637,7 @@ mod tests {
   "displayName": "{name}",
   "description": "desc",
   "unity": "2022.3",
-  "author": {{ "name": "Author" }},
+  "author": {{ "name": "Author", "email": "author@example.com" }},
   "url": "{url}"
 }}"#
         )
@@ -513,12 +655,23 @@ mod tests {
             keywords: vec![],
             author: PackageAuthor {
                 name: "Author".to_string(),
-                email: String::new(),
+                email: "author@example.com".to_string(),
                 url: String::new(),
             },
             vpm_dependencies: IndexMap::new(),
+            legacy_folders: IndexMap::new(),
+            legacy_files: IndexMap::new(),
+            legacy_packages: vec![],
+            documentation_url: String::new(),
+            changelog_url: String::new(),
+            licenses_url: String::new(),
+            samples: vec![],
+            hide_in_editor: None,
+            package_type: String::new(),
+            zip_sha256: String::new(),
             url: url.to_string(),
             license: String::new(),
+            extra: IndexMap::new(),
         }
     }
 
@@ -944,6 +1097,762 @@ mod tests {
                     "9.9.9",
                     "https://download.example/pkg1-v2.zip",
                 ),
+            )]),
+            delays_ms: HashMap::new(),
+        });
+
+        let fetcher = PackageFetcher::new(
+            github,
+            FetcherConfig {
+                max_concurrent: 4,
+                max_retries: 0,
+                asset_name: "package.json".to_string(),
+            },
+        );
+
+        let result = fetcher
+            .fetch(&manifest, &mut lockfile, None::<&TestProgress>)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::FetchPartialFailure { count: 1 })
+        ));
+
+        let pkg1 = lockfile.get_package("com.test.vpm.pkg1").unwrap();
+        assert_eq!(pkg1.versions.len(), 1);
+        assert_eq!(pkg1.versions[0].version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_manifest_missing_author_email() {
+        let manifest = manifest_two_packages();
+        let mut lockfile = initial_lockfile();
+
+        let github = Arc::new(FakeGitHub {
+            releases: HashMap::from([
+                (
+                    "owner1/repo1".to_string(),
+                    vec![Release::new(
+                        "v2.0.0".to_string(),
+                        Some("https://assets.example/pkg1-v2.json".to_string()),
+                    )],
+                ),
+                ("owner2/repo2".to_string(), Vec::new()),
+            ]),
+            assets: HashMap::from([(
+                "https://assets.example/pkg1-v2.json".to_string(),
+                r#"{
+  "name": "com.test.vpm.pkg1",
+  "version": "2.0.0",
+  "displayName": "com.test.vpm.pkg1",
+  "description": "desc",
+  "unity": "2022.3",
+  "author": {"name": "Author"},
+  "url": "https://download.example/pkg1-v2.zip"
+}"#
+                .to_string(),
+            )]),
+            delays_ms: HashMap::new(),
+        });
+
+        let fetcher = PackageFetcher::new(
+            github,
+            FetcherConfig {
+                max_concurrent: 4,
+                max_retries: 0,
+                asset_name: "package.json".to_string(),
+            },
+        );
+
+        let result = fetcher
+            .fetch(&manifest, &mut lockfile, None::<&TestProgress>)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::FetchPartialFailure { count: 1 })
+        ));
+
+        let pkg1 = lockfile.get_package("com.test.vpm.pkg1").unwrap();
+        assert_eq!(pkg1.versions.len(), 1);
+        assert_eq!(pkg1.versions[0].version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_manifest_missing_author_field() {
+        let manifest = manifest_two_packages();
+        let mut lockfile = initial_lockfile();
+
+        let github = Arc::new(FakeGitHub {
+            releases: HashMap::from([
+                (
+                    "owner1/repo1".to_string(),
+                    vec![Release::new(
+                        "v2.0.0".to_string(),
+                        Some("https://assets.example/pkg1-v2.json".to_string()),
+                    )],
+                ),
+                ("owner2/repo2".to_string(), Vec::new()),
+            ]),
+            assets: HashMap::from([(
+                "https://assets.example/pkg1-v2.json".to_string(),
+                r#"{
+  "name": "com.test.vpm.pkg1",
+  "version": "2.0.0",
+  "displayName": "com.test.vpm.pkg1",
+  "description": "desc",
+  "unity": "2022.3",
+  "url": "https://download.example/pkg1-v2.zip"
+}"#
+                .to_string(),
+            )]),
+            delays_ms: HashMap::new(),
+        });
+
+        let fetcher = PackageFetcher::new(
+            github,
+            FetcherConfig {
+                max_concurrent: 4,
+                max_retries: 0,
+                asset_name: "package.json".to_string(),
+            },
+        );
+
+        let result = fetcher
+            .fetch(&manifest, &mut lockfile, None::<&TestProgress>)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::FetchPartialFailure { count: 1 })
+        ));
+
+        let pkg1 = lockfile.get_package("com.test.vpm.pkg1").unwrap();
+        assert_eq!(pkg1.versions.len(), 1);
+        assert_eq!(pkg1.versions[0].version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn fetch_accepts_manifest_author_string_with_email() {
+        let manifest = manifest_two_packages();
+        let mut lockfile = initial_lockfile();
+
+        let github = Arc::new(FakeGitHub {
+            releases: HashMap::from([
+                (
+                    "owner1/repo1".to_string(),
+                    vec![Release::new(
+                        "v2.0.0".to_string(),
+                        Some("https://assets.example/pkg1-v2.json".to_string()),
+                    )],
+                ),
+                ("owner2/repo2".to_string(), Vec::new()),
+            ]),
+            assets: HashMap::from([(
+                "https://assets.example/pkg1-v2.json".to_string(),
+                r#"{
+  "name": "com.test.vpm.pkg1",
+  "version": "2.0.0",
+  "displayName": "com.test.vpm.pkg1",
+  "description": "desc",
+  "unity": "2022.3",
+  "author": "Author <author@example.com> (https://example.com)",
+  "url": "https://download.example/pkg1-v2.zip"
+}"#
+                .to_string(),
+            )]),
+            delays_ms: HashMap::new(),
+        });
+
+        let fetcher = PackageFetcher::new(
+            github,
+            FetcherConfig {
+                max_concurrent: 4,
+                max_retries: 0,
+                asset_name: "package.json".to_string(),
+            },
+        );
+
+        fetcher
+            .fetch(&manifest, &mut lockfile, None::<&TestProgress>)
+            .await
+            .unwrap();
+
+        let pkg1 = lockfile.get_package("com.test.vpm.pkg1").unwrap();
+        assert_eq!(pkg1.versions.len(), 2);
+        assert_eq!(pkg1.versions[0].version, "2.0.0");
+        assert_eq!(pkg1.versions[0].manifest.author.name, "Author");
+        assert_eq!(pkg1.versions[0].manifest.author.email, "author@example.com");
+        assert_eq!(pkg1.versions[0].manifest.author.url, "https://example.com");
+    }
+
+    #[tokio::test]
+    async fn fetch_accepts_manifest_missing_unity() {
+        let manifest = manifest_two_packages();
+        let mut lockfile = initial_lockfile();
+
+        let github = Arc::new(FakeGitHub {
+            releases: HashMap::from([
+                (
+                    "owner1/repo1".to_string(),
+                    vec![Release::new(
+                        "v2.0.0".to_string(),
+                        Some("https://assets.example/pkg1-v2.json".to_string()),
+                    )],
+                ),
+                ("owner2/repo2".to_string(), Vec::new()),
+            ]),
+            assets: HashMap::from([(
+                "https://assets.example/pkg1-v2.json".to_string(),
+                r#"{
+  "name": "com.test.vpm.pkg1",
+  "version": "2.0.0",
+  "displayName": "com.test.vpm.pkg1",
+  "description": "desc",
+  "author": {"name": "Author", "email": "author@example.com"},
+  "url": "https://download.example/pkg1-v2.zip"
+}"#
+                .to_string(),
+            )]),
+            delays_ms: HashMap::new(),
+        });
+
+        let fetcher = PackageFetcher::new(
+            github,
+            FetcherConfig {
+                max_concurrent: 4,
+                max_retries: 0,
+                asset_name: "package.json".to_string(),
+            },
+        );
+
+        fetcher
+            .fetch(&manifest, &mut lockfile, None::<&TestProgress>)
+            .await
+            .unwrap();
+
+        let pkg1 = lockfile.get_package("com.test.vpm.pkg1").unwrap();
+        assert_eq!(pkg1.versions.len(), 2);
+        assert_eq!(pkg1.versions[0].version, "2.0.0");
+        assert_eq!(pkg1.versions[0].manifest.unity, "");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_manifest_with_invalid_unity_version() {
+        let manifest = manifest_two_packages();
+        let mut lockfile = initial_lockfile();
+
+        let github = Arc::new(FakeGitHub {
+            releases: HashMap::from([
+                (
+                    "owner1/repo1".to_string(),
+                    vec![Release::new(
+                        "v2.0.0".to_string(),
+                        Some("https://assets.example/pkg1-v2.json".to_string()),
+                    )],
+                ),
+                ("owner2/repo2".to_string(), Vec::new()),
+            ]),
+            assets: HashMap::from([(
+                "https://assets.example/pkg1-v2.json".to_string(),
+                r#"{
+  "name": "com.test.vpm.pkg1",
+  "version": "2.0.0",
+  "displayName": "com.test.vpm.pkg1",
+  "description": "desc",
+  "unity": "invalid",
+  "author": {"name": "Author", "email": "author@example.com"},
+  "url": "https://download.example/pkg1-v2.zip"
+}"#
+                .to_string(),
+            )]),
+            delays_ms: HashMap::new(),
+        });
+
+        let fetcher = PackageFetcher::new(
+            github,
+            FetcherConfig {
+                max_concurrent: 4,
+                max_retries: 0,
+                asset_name: "package.json".to_string(),
+            },
+        );
+
+        let result = fetcher
+            .fetch(&manifest, &mut lockfile, None::<&TestProgress>)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::FetchPartialFailure { count: 1 })
+        ));
+
+        let pkg1 = lockfile.get_package("com.test.vpm.pkg1").unwrap();
+        assert_eq!(pkg1.versions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_accepts_manifest_with_valid_unity_release() {
+        let manifest = manifest_two_packages();
+        let mut lockfile = initial_lockfile();
+
+        let github = Arc::new(FakeGitHub {
+            releases: HashMap::from([
+                (
+                    "owner1/repo1".to_string(),
+                    vec![Release::new(
+                        "v2.0.0".to_string(),
+                        Some("https://assets.example/pkg1-v2.json".to_string()),
+                    )],
+                ),
+                ("owner2/repo2".to_string(), Vec::new()),
+            ]),
+            assets: HashMap::from([(
+                "https://assets.example/pkg1-v2.json".to_string(),
+                r#"{
+  "name": "com.test.vpm.pkg1",
+  "version": "2.0.0",
+  "displayName": "com.test.vpm.pkg1",
+  "description": "desc",
+  "unity": "2022.3",
+  "unityRelease": "22f1",
+  "author": {"name": "Author", "email": "author@example.com"},
+  "url": "https://download.example/pkg1-v2.zip"
+}"#
+                .to_string(),
+            )]),
+            delays_ms: HashMap::new(),
+        });
+
+        let fetcher = PackageFetcher::new(
+            github,
+            FetcherConfig {
+                max_concurrent: 4,
+                max_retries: 0,
+                asset_name: "package.json".to_string(),
+            },
+        );
+
+        let result = fetcher
+            .fetch(&manifest, &mut lockfile, None::<&TestProgress>)
+            .await;
+        assert!(result.is_ok());
+
+        let pkg1 = lockfile.get_package("com.test.vpm.pkg1").unwrap();
+        assert_eq!(pkg1.versions.len(), 2);
+        assert_eq!(pkg1.versions[0].version, "2.0.0");
+        assert_eq!(pkg1.versions[0].manifest.unity_release, "22f1");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_manifest_with_unity_release_without_unity() {
+        let manifest = manifest_two_packages();
+        let mut lockfile = initial_lockfile();
+
+        let github = Arc::new(FakeGitHub {
+            releases: HashMap::from([
+                (
+                    "owner1/repo1".to_string(),
+                    vec![Release::new(
+                        "v2.0.0".to_string(),
+                        Some("https://assets.example/pkg1-v2.json".to_string()),
+                    )],
+                ),
+                ("owner2/repo2".to_string(), Vec::new()),
+            ]),
+            assets: HashMap::from([(
+                "https://assets.example/pkg1-v2.json".to_string(),
+                r#"{
+  "name": "com.test.vpm.pkg1",
+  "version": "2.0.0",
+  "displayName": "com.test.vpm.pkg1",
+  "description": "desc",
+  "unityRelease": "22f1",
+  "author": {"name": "Author", "email": "author@example.com"},
+  "url": "https://download.example/pkg1-v2.zip"
+}"#
+                .to_string(),
+            )]),
+            delays_ms: HashMap::new(),
+        });
+
+        let fetcher = PackageFetcher::new(
+            github,
+            FetcherConfig {
+                max_concurrent: 4,
+                max_retries: 0,
+                asset_name: "package.json".to_string(),
+            },
+        );
+
+        let result = fetcher
+            .fetch(&manifest, &mut lockfile, None::<&TestProgress>)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::FetchPartialFailure { count: 1 })
+        ));
+
+        let pkg1 = lockfile.get_package("com.test.vpm.pkg1").unwrap();
+        assert_eq!(pkg1.versions.len(), 1);
+        assert_eq!(pkg1.versions[0].version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_manifest_with_invalid_unity_release() {
+        let manifest = manifest_two_packages();
+        let mut lockfile = initial_lockfile();
+
+        let github = Arc::new(FakeGitHub {
+            releases: HashMap::from([
+                (
+                    "owner1/repo1".to_string(),
+                    vec![Release::new(
+                        "v2.0.0".to_string(),
+                        Some("https://assets.example/pkg1-v2.json".to_string()),
+                    )],
+                ),
+                ("owner2/repo2".to_string(), Vec::new()),
+            ]),
+            assets: HashMap::from([(
+                "https://assets.example/pkg1-v2.json".to_string(),
+                r#"{
+  "name": "com.test.vpm.pkg1",
+  "version": "2.0.0",
+  "displayName": "com.test.vpm.pkg1",
+  "description": "desc",
+  "unity": "2022.3",
+  "unityRelease": "0beta4",
+  "author": {"name": "Author", "email": "author@example.com"},
+  "url": "https://download.example/pkg1-v2.zip"
+}"#
+                .to_string(),
+            )]),
+            delays_ms: HashMap::new(),
+        });
+
+        let fetcher = PackageFetcher::new(
+            github,
+            FetcherConfig {
+                max_concurrent: 4,
+                max_retries: 0,
+                asset_name: "package.json".to_string(),
+            },
+        );
+
+        let result = fetcher
+            .fetch(&manifest, &mut lockfile, None::<&TestProgress>)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::FetchPartialFailure { count: 1 })
+        ));
+
+        let pkg1 = lockfile.get_package("com.test.vpm.pkg1").unwrap();
+        assert_eq!(pkg1.versions.len(), 1);
+        assert_eq!(pkg1.versions[0].version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_manifest_with_invalid_semver_version() {
+        let manifest = manifest_two_packages();
+        let mut lockfile = initial_lockfile();
+
+        let github = Arc::new(FakeGitHub {
+            releases: HashMap::from([
+                (
+                    "owner1/repo1".to_string(),
+                    vec![Release::new(
+                        "v2".to_string(),
+                        Some("https://assets.example/pkg1-v2.json".to_string()),
+                    )],
+                ),
+                ("owner2/repo2".to_string(), Vec::new()),
+            ]),
+            assets: HashMap::from([(
+                "https://assets.example/pkg1-v2.json".to_string(),
+                r#"{
+  "name": "com.test.vpm.pkg1",
+  "version": "2",
+  "displayName": "com.test.vpm.pkg1",
+  "description": "desc",
+  "unity": "2022.3",
+  "author": {"name": "Author", "email": "author@example.com"},
+  "url": "https://download.example/pkg1-v2.zip"
+}"#
+                .to_string(),
+            )]),
+            delays_ms: HashMap::new(),
+        });
+
+        let fetcher = PackageFetcher::new(
+            github,
+            FetcherConfig {
+                max_concurrent: 4,
+                max_retries: 0,
+                asset_name: "package.json".to_string(),
+            },
+        );
+
+        let result = fetcher
+            .fetch(&manifest, &mut lockfile, None::<&TestProgress>)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::FetchPartialFailure { count: 1 })
+        ));
+
+        let pkg1 = lockfile.get_package("com.test.vpm.pkg1").unwrap();
+        assert_eq!(pkg1.versions.len(), 1);
+        assert_eq!(pkg1.versions[0].version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_manifest_with_invalid_package_url() {
+        let manifest = manifest_two_packages();
+        let mut lockfile = initial_lockfile();
+
+        let github = Arc::new(FakeGitHub {
+            releases: HashMap::from([
+                (
+                    "owner1/repo1".to_string(),
+                    vec![Release::new(
+                        "v2.0.0".to_string(),
+                        Some("https://assets.example/pkg1-v2.json".to_string()),
+                    )],
+                ),
+                ("owner2/repo2".to_string(), Vec::new()),
+            ]),
+            assets: HashMap::from([(
+                "https://assets.example/pkg1-v2.json".to_string(),
+                r#"{
+  "name": "com.test.vpm.pkg1",
+  "version": "2.0.0",
+  "displayName": "com.test.vpm.pkg1",
+  "description": "desc",
+  "unity": "2022.3",
+  "author": {"name": "Author", "email": "author@example.com"},
+  "url": "not-a-url"
+}"#
+                .to_string(),
+            )]),
+            delays_ms: HashMap::new(),
+        });
+
+        let fetcher = PackageFetcher::new(
+            github,
+            FetcherConfig {
+                max_concurrent: 4,
+                max_retries: 0,
+                asset_name: "package.json".to_string(),
+            },
+        );
+
+        let result = fetcher
+            .fetch(&manifest, &mut lockfile, None::<&TestProgress>)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::FetchPartialFailure { count: 1 })
+        ));
+
+        let pkg1 = lockfile.get_package("com.test.vpm.pkg1").unwrap();
+        assert_eq!(pkg1.versions.len(), 1);
+        assert_eq!(pkg1.versions[0].version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_manifest_with_non_zip_package_url() {
+        let manifest = manifest_two_packages();
+        let mut lockfile = initial_lockfile();
+
+        let github = Arc::new(FakeGitHub {
+            releases: HashMap::from([
+                (
+                    "owner1/repo1".to_string(),
+                    vec![Release::new(
+                        "v2.0.0".to_string(),
+                        Some("https://assets.example/pkg1-v2.json".to_string()),
+                    )],
+                ),
+                ("owner2/repo2".to_string(), Vec::new()),
+            ]),
+            assets: HashMap::from([(
+                "https://assets.example/pkg1-v2.json".to_string(),
+                r#"{
+  "name": "com.test.vpm.pkg1",
+  "version": "2.0.0",
+  "displayName": "com.test.vpm.pkg1",
+  "description": "desc",
+  "unity": "2022.3",
+  "author": {"name": "Author", "email": "author@example.com"},
+  "url": "https://download.example/pkg1-v2.json"
+}"#
+                .to_string(),
+            )]),
+            delays_ms: HashMap::new(),
+        });
+
+        let fetcher = PackageFetcher::new(
+            github,
+            FetcherConfig {
+                max_concurrent: 4,
+                max_retries: 0,
+                asset_name: "package.json".to_string(),
+            },
+        );
+
+        let result = fetcher
+            .fetch(&manifest, &mut lockfile, None::<&TestProgress>)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::FetchPartialFailure { count: 1 })
+        ));
+
+        let pkg1 = lockfile.get_package("com.test.vpm.pkg1").unwrap();
+        assert_eq!(pkg1.versions.len(), 1);
+        assert_eq!(pkg1.versions[0].version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_manifest_with_unity_dependency_range() {
+        let manifest = manifest_two_packages();
+        let mut lockfile = initial_lockfile();
+
+        let github = Arc::new(FakeGitHub {
+            releases: HashMap::from([
+                (
+                    "owner1/repo1".to_string(),
+                    vec![Release::new(
+                        "v2.0.0".to_string(),
+                        Some("https://assets.example/pkg1-v2.json".to_string()),
+                    )],
+                ),
+                ("owner2/repo2".to_string(), Vec::new()),
+            ]),
+            assets: HashMap::from([(
+                "https://assets.example/pkg1-v2.json".to_string(),
+                r#"{
+  "name": "com.test.vpm.pkg1",
+  "version": "2.0.0",
+  "displayName": "com.test.vpm.pkg1",
+  "description": "desc",
+  "unity": "2022.3",
+  "dependencies": {
+    "com.unity.modules.physics": "^1.0.0"
+  },
+  "author": {"name": "Author", "email": "author@example.com"},
+  "url": "https://download.example/pkg1-v2.zip"
+}"#
+                .to_string(),
+            )]),
+            delays_ms: HashMap::new(),
+        });
+
+        let fetcher = PackageFetcher::new(
+            github,
+            FetcherConfig {
+                max_concurrent: 4,
+                max_retries: 0,
+                asset_name: "package.json".to_string(),
+            },
+        );
+
+        let result = fetcher
+            .fetch(&manifest, &mut lockfile, None::<&TestProgress>)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::FetchPartialFailure { count: 1 })
+        ));
+
+        let pkg1 = lockfile.get_package("com.test.vpm.pkg1").unwrap();
+        assert_eq!(pkg1.versions.len(), 1);
+        assert_eq!(pkg1.versions[0].version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn fetch_accepts_manifest_with_vpm_dependency_x_range() {
+        let manifest = manifest_two_packages();
+        let mut lockfile = initial_lockfile();
+
+        let github = Arc::new(FakeGitHub {
+            releases: HashMap::from([
+                (
+                    "owner1/repo1".to_string(),
+                    vec![Release::new(
+                        "v2.0.0".to_string(),
+                        Some("https://assets.example/pkg1-v2.json".to_string()),
+                    )],
+                ),
+                ("owner2/repo2".to_string(), Vec::new()),
+            ]),
+            assets: HashMap::from([(
+                "https://assets.example/pkg1-v2.json".to_string(),
+                r#"{
+  "name": "com.test.vpm.pkg1",
+  "version": "2.0.0",
+  "displayName": "com.test.vpm.pkg1",
+  "description": "desc",
+  "unity": "2022.3",
+  "author": {"name": "Author", "email": "author@example.com"},
+  "vpmDependencies": {
+    "com.vrchat.base": "3.5.x"
+  },
+  "url": "https://download.example/pkg1-v2.zip"
+}"#
+                .to_string(),
+            )]),
+            delays_ms: HashMap::new(),
+        });
+
+        let fetcher = PackageFetcher::new(
+            github,
+            FetcherConfig {
+                max_concurrent: 4,
+                max_retries: 0,
+                asset_name: "package.json".to_string(),
+            },
+        );
+
+        let result = fetcher
+            .fetch(&manifest, &mut lockfile, None::<&TestProgress>)
+            .await;
+        assert!(result.is_ok());
+
+        let pkg1 = lockfile.get_package("com.test.vpm.pkg1").unwrap();
+        assert_eq!(pkg1.versions.len(), 2);
+        assert_eq!(pkg1.versions[0].version, "2.0.0");
+        assert_eq!(pkg1.versions[1].version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_manifest_with_invalid_zip_sha256() {
+        let manifest = manifest_two_packages();
+        let mut lockfile = initial_lockfile();
+
+        let github = Arc::new(FakeGitHub {
+            releases: HashMap::from([
+                (
+                    "owner1/repo1".to_string(),
+                    vec![Release::new(
+                        "v2.0.0".to_string(),
+                        Some("https://assets.example/pkg1-v2.json".to_string()),
+                    )],
+                ),
+                ("owner2/repo2".to_string(), Vec::new()),
+            ]),
+            assets: HashMap::from([(
+                "https://assets.example/pkg1-v2.json".to_string(),
+                r#"{
+  "name": "com.test.vpm.pkg1",
+  "version": "2.0.0",
+  "displayName": "com.test.vpm.pkg1",
+  "description": "desc",
+  "unity": "2022.3",
+  "author": {"name": "Author", "email": "author@example.com"},
+  "url": "https://download.example/pkg1-v2.zip",
+  "zipSHA256": "abc123"
+}"#
+                .to_string(),
             )]),
             delays_ms: HashMap::new(),
         });

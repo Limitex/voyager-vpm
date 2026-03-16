@@ -2521,7 +2521,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "cliclack",
- "console 0.15.11",
+ "console 0.16.2",
  "dotenvy",
  "futures",
  "indexmap",
